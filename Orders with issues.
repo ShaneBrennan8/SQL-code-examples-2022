@@ -1,0 +1,304 @@
+#A script highlighting my SQL. Includes, but is not limited to, windows functions, case statements, various calculations, and sub-queries
+
+WITH target_dates AS (
+
+    SELECT
+         DATE_SUB(DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY), INTERVAL 28 DAY)  AS l28_start_date,
+         DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)                             AS end_date,
+         DATE_SUB(CURRENT_DATE(), INTERVAL 28 DAY)                            AS last_month
+),
+
+/* Extract out the available zendesk tickets as these are ready for investigation */
+
+zendesk_confirmed_tickets AS (
+
+    SELECT
+    DISTINCT
+
+    CASE WHEN trim(title) ='Order Number' THEN CAST(cf.value AS INT64) END order_id_local
+
+    FROM `tickets_v1_ie_*` a,
+    UNNEST(custom_fields) as cf,
+    UNNEST (tags) ta
+    LEFT JOIN operations_database.complaints_zendesk.ticket_fields_v1_ie b ON cf.id = b.id
+    LEFT JOIN operations_database.complaints_zendesk.ticket_forms_v1_ie c ON ticket_form_id = c.id
+    
+    WHERE date(a.created_at) = (SELECT end_date FROM target_dates)
+    AND ta='cqt_previous_order__not_delivered' --| If agent has selected order not delivered in Zendesk
+
+),
+delivery_staging_information AS (
+    SELECT
+    fd.tenant_id                                            AS tenant_id,
+    fd.sys_order_id,
+    fo.order_number                                         AS order_number, 
+    fo.just_eat_order_number                                AS just_eat_order_number,
+    fo.order_datetime                                       AS order_datetime,
+    fo.order_date                                           AS order_date,
+    fo.custo_address                                        AS custo_address_fo,
+    op.custo_address_op                                     AS custo_address_op,
+    op.eircode                                              AS eircode_op,
+    fd.sys_courier_id                                       AS sys_courier_id,
+    ci.courier_email                                        AS courier_email,
+    fd.sys_courier_delivery_zone_id                         AS sys_courier_delivery_zone_id,
+    dz.sys_zone_group_id                                    AS sys_zone_group_id,
+    fd.collect_target_original_time_local,
+    fd.collect_target_time_local,
+    fd.deliver_original_total_driving_time_min              AS deliver_original_estimate_total_driving_time_min ,
+    fd.delivery_total_driving_time_min                      AS delivery_actual_total_driving_time_min,  
+    
+    DATETIME_DIFF (collect_completed_time_local, fd.collect_target_original_time_local, second)/60 AS original_expected_v_actual_collect,
+    DATETIME_DIFF (delivery_completed_time_local, fd.delivery_target_original_time_local,  second)/60 AS original_expected_v_actual_delivery,
+
+    DATETIME_DIFF (collect_completed_time_local, fd.collect_target_time_local, second)/60 AS revised_at_intransit_expected_v_actual_collect,
+    DATETIME_DIFF (delivery_completed_time_local, fd.delivery_target_time_local, second)/60 AS revised_at_intransit_expected_v_actual_delivery,
+
+    dz.zone_group_name                                      AS zone_group_name,
+    SAFE.ST_GEOGPOINT(fd.deliver_long, fd.deliver_lat)      AS custo_location,
+    cj.customer_address_js                                  AS customer_address_js,
+    cj.customer_address_geopoint                            AS customer_address_geopoint,
+    cj.customer_address_postal_code                         AS customer_address_postal_code,
+    cj.deliver_swipe_location                               AS deliver_swipe_location,
+    cj.job_type                                             AS job_type,
+    cj.expected_completion                                  AS expected_completion,
+    cj.begin_parking_time                                   AS begin_parking_time,
+    cj.entered_time                                         AS entered_time,
+    cj.expected_v_actual_delivery                           AS expected_v_actual_delivery_time, 
+    cj.time_waited_at_custo_js                              AS time_waited_at_custo_js,
+    cj.arrive_time_v_expected_from_intransit_time           AS arrive_time_v_expected_from_intransit_time,
+    CASE WHEN cj.in_transit_time  IS NULL THEN 'no' ELSE 'yes' END AS was_order_collected, 
+    cj.completed_time                                       AS completed_time,
+    cj.completed_geo_point                                  AS completed_geo_point,
+    eo.country_code,
+    eo.order_id_local,
+    eo.payment.food_price,
+    eo.payment.delivery_price                               AS delivery_charge_price,
+    eo.is_good_order                                        AS is_good_order,
+    fo.courier_pay2_subsidy                                 AS courier_pay2_subsidy,
+    fm.courier_pay2_subsidy                                 AS courier_pay2_subsidy_fm,
+    fm.paid_to_courier_courier_hold,
+    fm.courier_delivery_fees                                AS courier_delivery_fees_total,
+    fm.gear_up_amount,
+    tp.friendly_order_reference                             AS friendly_order_reference,              
+    tp.time_order_was_raised,
+    tp.immediate_delivery_flag                              AS immediate_delivery_flag,
+    tp.driver_assigned_rating                               AS driver_assigned_rating,
+    tp.driver_arrives_at_restaurant_rating                  AS driver_arrives_at_restaurant_rating,
+    tp.driver_leaves_restaurant_rating                      AS driver_leaves_restaurant_rating,
+    tp.driver_arrives_at_customer_rating                    AS driver_arrives_at_customer_rating,
+    tp.driver_completes_delivery_rating                     AS driver_completes_delivery_rating,
+    tp.driver_assigned_count                                AS driver_assigned_count, 
+    tp.time_waited_at_custo_tp                              AS time_waited_at_custo_tp,
+    cl.desc_agg                                             AS change_log_descriptions,
+    ds.time_between_movements_microsec                      AS time_between_movements_microsec,
+    ds.time_between_movements_millisec                      AS time_between_movements_millisec,
+    ds.time_between_movements_microsec                      AS time_between_movements_sec,
+    ds.time_between_movements_hour                          AS time_between_movements_hour,
+    ds.distance_between_movements_km                        AS distance_between_movements_km,
+    ds.speed_between_movements_km_per_hour_2                AS speed_between_movements_km_per_hour,
+
+    CASE WHEN cl.desc_agg LIKE '%The courier has marked this order as Undelivered. They arrived at the given%' 
+    THEN 'yes, self_serve' ELSE 'no' END                    AS courier_self_serve
+    
+
+
+    FROM `operations_database_warehouse.analytics_warehouse.fact_deliveries`                   AS fd
+    LEFT JOIN `operations_database_warehouse.analytics_warehouse.dim_courier_delivery_zones`   AS dz ON dz.sys_courier_delivery_zone_id = fd.sys_courier_delivery_zone_id
+    LEFT JOIN `operations_database_warehouse.analytics_warehouse.fact_orders_resto`            AS fo ON fo.sys_order_id                 = fd.sys_order_id
+    LEFT JOIN `operations_database_warehouse.analytics_warehouse.fact_order_financial_metrics` AS fm ON fm.just_eat_order_number = fo.just_eat_order_number
+    LEFT JOIN `just-data-warehouse.central_ecommerce.order`                                  AS eo ON eo.order_id_local = fo.just_eat_order_number
+
+
+    LEFT JOIN
+            (
+                SELECT
+                delivery_id,
+                job_type,
+                SAFE.ST_GEOGPOINT(completed_longitude, completed_latitude) AS deliver_swipe_location,
+                expected_completion,
+                begin_parking_time,
+                entered_time,
+                DATETIME_DIFF (entered_time, begin_parking_time, second)/60 AS parking_to_entered_diff,
+                in_transit_time,
+                DATETIME_DIFF (expected_completion, begin_parking_time, second)/60 AS expected_v_actual_delivery,
+                DATETIME_DIFF (arrived_estimate, arrived_time, second)/60 AS arrive_time_v_expected_from_intransit_time,
+                DATETIME_DIFF (in_transit_time, in_transit_request_time, second)/60 AS  in_trans_to_in_trans_request_time_diff,
+                DATETIME_DIFF (in_transit_gps_reading_time,in_transit_request_time, second)/60  in_tran_request_to_gps_reading_time_diff,
+                ST_GEOGPOINT(in_transit_latitude, in_transit_longitude) AS in_transit_geo_point,
+                DATETIME_DIFF (completed_time, begin_parking_time, second)/60 AS time_waited_at_custo_js,
+                in_transit_speed,
+                ST_GEOGPOINT(arrived_latitude, arrived_longitude) AS arrived_geo_point,
+                in_transit_accuracy,
+                arrived_gps_reading_time,
+                arrived_speed,
+                arrived_accuracy,
+                completed_time,
+                completed_gps_reading_time,
+                ST_GEOGPOINT(completed_latitude,completed_longitude) AS completed_geo_point,
+                completed_speed,
+                completed_accuracy,
+                legitimacy,
+                address_address1 as customer_address_js,
+                ST_GEOGPOINT(address_lat,address_long) AS customer_address_geopoint,
+                address_postal_code AS customer_address_postal_code
+                
+
+                FROM `operations_database_warehouse.clean_data_lake.jslice_couriers_courier_jobs_ie`
+                WHERE
+                job_type = 'DELIVER'
+            )                                                                             AS cj ON cj.delivery_id  = fd.sys_delivery_id
+    LEFT JOIN(operations_database_warehouse.analytics_warehouse
+                SELECT
+                dc.email                                                                   AS courier_email,
+                dc.sys_courier_id                                                          AS courier_id,
+                STRING_AGG(pn.phone_number, ' | ')                                         AS phone_numbers
+                FROM
+                `operations_database_warehouse.analytics_warehouse.dim_couriers`                AS dc 
+                LEFT JOIN `operations_database_warehouse.analytics_warehouse.dim_courier_phone_numbers`  AS pn  ON pn.sys_courier_id = dc.sys_courier_id
+                LEFT JOIN `operations_database_warehouse.analytics_warehouse.dim_courier_delivery_zone_ids` AS dzi on dzi.sys_courier_id=dc.sys_courier_id
+                LEFT JOIN `operations_database_warehouse.analytics_warehouse.dim_courier_delivery_zones` AS dz on dz.sys_delivery_zone_id =dzi.sys_delivery_zone_id
+   
+
+
+                GROUP BY 1,2)                                                         AS ci ON ci.courier_id = fd.sys_courier_id
+    LEFT JOIN (
+                SELECT
+                friendly_order_reference,
+                time_order_was_raised,
+                immediate_delivery_flag,
+                driver_assigned_rating,
+                driver_arrives_at_restaurant_rating,
+                driver_leaves_restaurant_rating,
+                driver_arrives_at_customer_rating,
+                driver_completes_delivery_rating,
+                driver_assigned_count,
+
+                DATETIME_DIFF (driver_completes_delivery_time_stamp, driver_arrives_at_customer_time_stamp, second)/60 time_waited_at_custo_tp
+                FROM `operations_database_warehouse.op_timestamps.third_party_data_with_chain_and_pool` 
+                WHERE date_order_was_raised = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY) 
+                AND country = 'ie'
+
+                )                                                             AS tp ON     tp.friendly_order_reference = fo.just_eat_order_number
+
+
+    LEFT JOIN(
+                SELECT DISTINCT
+                order_id,
+                created_time,
+                -- description,
+                STRING_AGG(description, ", ") OVER (PARTITION BY order_id ORDER BY created_time ASC) AS desc_agg,
+                -- CASE WHEN description LIKE 'The courier has marked this order as Undelivered. They arrived at the given%' THEN 'yes, self_serve' ELSE 'no' END AS courier_self_serve,
+                ROW_NUMBER() OVER(PARTITION BY order_id ORDER BY created_time DESC) AS row_num
+                FROM `operations_database_warehouse.clean_data_lake.jslice_orders_order_change_log_ie`
+                WHERE   DATE(created_time) = DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
+                ORDER BY created_time DESC
+           
+
+            )                                 AS cl ON cl.order_id = fd.sys_order_id
+    LEFT JOIN(
+                SELECT
+                op.LegacyOrderId as legacy_order_id,
+                op.Customer.Address AS custo_address_op,
+                op.Customer.City,
+                op.Customer.Postcode AS eircode,
+                ST_GEOGPOINT(Customer.GeoPosition.Longitude,
+                Customer.GeoPosition.Latitude) AS client_location
+                FROM `operations_database.production_central.orderplaced_ie_*` AS op
+                WHERE tenant = 'ie'
+            )                                  AS op ON  op.legacy_order_id = fo.just_eat_order_number
+    LEFT JOIN(
+                SELECT
+                l.FriendlyOrderReference,
+                datetime_diff(TimeStamp, lag(TimeStamp) over(partition by l.FriendlyOrderReference order by TimeStamp asc), microsecond) as time_between_movements_microsec,
+                datetime_diff(TimeStamp, lag(TimeStamp) over(partition by l.FriendlyOrderReference order by TimeStamp asc), millisecond) as time_between_movements_millisec,
+                datetime_diff(TimeStamp, lag(TimeStamp) over(partition by l.FriendlyOrderReference order by TimeStamp asc), SECOND) as time_between_movements_sec,
+                datetime_diff(TimeStamp, lag(TimeStamp) over(partition by l.FriendlyOrderReference order by TimeStamp asc), hour) as time_between_movements_hour,
+                
+                ST_DISTANCE(SAFE.ST_GEOGPOINT(l.DriverLocation.Longitude, l.DriverLocation.Latitude),SAFE.ST_GEOGPOINT(lag(l.DriverLocation.Longitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc),lag(l.DriverLocation.Latitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc)))/1000 as distance_between_movements_km,
+                
+                safe_divide(ST_DISTANCE(SAFE.ST_GEOGPOINT(l.DriverLocation.Longitude, l.DriverLocation.Latitude),SAFE.ST_GEOGPOINT(lag(l.DriverLocation.Longitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc),lag(l.DriverLocation.Latitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc)))/1000, (case when datetime_diff(TimeStamp, lag(TimeStamp) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc), second)=0 then 0.00000001 else datetime_diff(TimeStamp, lag(TimeStamp) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc), second) end)*0.000277778) as speed_between_movements_km_per_hour,
+                
+                safe_divide(ST_DISTANCE(SAFE.ST_GEOGPOINT(l.DriverLocation.Longitude, l.DriverLocation.Latitude),SAFE.ST_GEOGPOINT(lag(l.DriverLocation.Longitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc),lag(l.DriverLocation.Latitude) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc)))/1000, (datetime_diff(TimeStamp, lag(TimeStamp) 
+                over(partition by l.FriendlyOrderReference order by TimeStamp asc), millisecond))*0.000000277778) as speed_between_movements_km_per_hour_2,
+                
+                a.FriendlyOrderReference as reassign_id
+                FROM `operations_database.op_timestamps.drivertracking_ie_*` l
+                left join
+                (select distinct FriendlyOrderReference from `operations_database.op_timestamps.drivertrackingassigned_ie_**`
+                where isreassignment=true) a
+                on l.FriendlyOrderReference=a.FriendlyOrderReference
+                left join `operations_database_warehouse.op_timestamps.third_party_data_with_chain_and_pool` t
+                on l.FriendlyOrderReference=cast(t.friendly_order_reference as string)
+                where time_order_was_raised >= date_trunc(current_date(), week(monday))-8
+                and time_order_was_raised < date_trunc(current_date(), week(monday))
+                and test_order_flag is false
+                and country='is'
+
+            )                                   AS ds ON     ds.FriendlyOrderReference = fo.sys_order_id 
+
+
+    WHERE
+    fo.order_date = (SELECT end_date FROM target_dates) 
+    AND eo.partition_date_local >= (SELECT last_month FROM target_dates)
+    AND eo.order_date_local = (SELECT end_date FROM target_dates)
+    AND fm.order_date = (SELECT end_date FROM target_dates)
+    AND (cl.row_num = 1 OR cl.row_num IS NULL)
+    
+    AND fd.tenant_id = 'ie'
+
+)
+
+SELECT 
+DISTINCT
+di.sys_order_id,
+di.order_number,    
+di.just_eat_order_number,
+di.order_datetime,
+di.is_good_order,
+di.courier_delivery_fees_total,
+di.was_order_collected,
+di.driver_assigned_count,
+di.deliver_original_estimate_total_driving_time_min as ctod_estimate,
+di.delivery_actual_total_driving_time_min as ctod_actual,
+/*di.original_expected_v_actual_collect,
+di.original_expected_v_actual_delivery,# will have to look at this again
+/*di.revised_at_intransit_expected_v_actual_collect,
+di.revised_at_intransit_expected_v_actual_delivery,*/
+ST_DISTANCE(di.deliver_swipe_location, di.custo_location) AS deliver_swipe_distance_from_custo,
+
+CASE 
+    WHEN (ST_DISTANCE(di.deliver_swipe_location, di.custo_location))  IS NULL AND is_good_order IS TRUE
+    THEN 'We swiped delivered' 
+    WHEN (ST_DISTANCE(di.deliver_swipe_location, di.custo_location))  IS NULL AND is_good_order IS FALSE
+    THEN 'No swipe took place as we have no delivery time details' 
+    ELSE 'Courier swiped delivered' END AS who_swiped_delivered,
+
+--di.change_log_descriptions,
+di.courier_self_serve,
+di.time_waited_at_custo_js AS time_waited_at_customer,
+di.sys_courier_id, 
+di.courier_email,
+di.custo_address_fo AS custo_address_live_ops,
+di.custo_address_op AS custo_address_just_eat,
+di.eircode_op       AS eircode_just_eat,
+di.driver_completes_delivery_rating,
+di.change_log_descriptions,
+di.time_between_movements_microsec,
+di.time_between_movements_millisec,
+di.time_between_movements_sec,
+di.time_between_movements_hour,
+di.distance_between_movements_km,
+di.speed_between_movements_km_per_hour,
+
+FROM zendesk_confirmed_tickets as zct
+INNER JOIN delivery_staging_information AS di ON di.just_eat_order_number = zct.order_id_local
+
+WHERE di.driver_completes_delivery_rating NOT LIKE '%high%'
