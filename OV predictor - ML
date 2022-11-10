@@ -1,0 +1,87 @@
+ITH BASE AS (  SELECT
+  r.resto_name,
+  r.just_eat_id,
+  delivery_zones.zone_name  AS zone_name,
+  del.sys_order_id,
+  resto_core.primary_cuisine_name,
+  #resto_core.secondary_cuisine_name,
+  fm.food_subtotal,
+  del.delivery_completed_date_local,
+
+  FIRST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+    AS first_order_date,
+
+  LAST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+    AS last_order_date, 
+
+  #order within first week
+    CASE WHEN del.delivery_completed_date_local BETWEEN
+    FIRST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+    AND
+    DATE_ADD(
+    FIRST_VALUE (del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local 
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), INTERVAL 7 DAY) THEN 1 ELSE 0 END AS ov_first_week_resto,
+
+  #order within first Month
+  CASE WHEN del.delivery_completed_date_local BETWEEN
+    FIRST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+    AND
+    DATE_ADD(
+    FIRST_VALUE (del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local 
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) , INTERVAL 28 DAY) THEN 1 ELSE 0 END AS ov_first_month_resto,
+
+  #order within first year
+  CASE WHEN del.delivery_completed_date_local BETWEEN
+  FIRST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+    AND 
+    DATE_ADD( FIRST_VALUE (del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local 
+    ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) , INTERVAL 365 DAY) 
+
+  #AND
+  #LAST_VALUE(del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING )
+  #>
+  #DATE_ADD( FIRST_VALUE (del.delivery_completed_date_local) OVER (PARTITION BY r.just_eat_id ORDER BY del.delivery_completed_date_local ROWS BETWEEN UNBOUNDED PRECEDING AND #UNBOUNDED FOLLOWING) , INTERVAL 365 DAY) 
+  THEN 1 ELSE 0 END AS ov_first_year_resto,
+
+
+  FROM `just-data-warehouse.delco_analytics_team_dwh.fact_deliveries` AS del
+  LEFT JOIN `just-data-warehouse.delco_analytics_team_dwh.dim_resto` AS r
+  ON del.sys_resto_id = r.sys_resto_id
+  LEFT JOIN `just-data-warehouse.delco_analytics_team_dwh.fact_order_financial_metrics` AS fm 
+  ON del.sys_order_id=fm.sys_order_id
+  LEFT JOIN `just-data-warehouse.delco_analytics_team_dwh.dim_courier_delivery_zones`  AS delivery_zones 
+  ON r.sys_delivery_zone_id = delivery_zones.sys_delivery_zone_id
+  LEFT JOIN `just-data-warehouse.core_ecommerce.restaurant` AS resto_core
+  ON CAST(r.just_eat_id AS INT64) = resto_core.restaurant_id_local
+
+
+  WHERE del.tenant_id = 'ie'
+  AND del.skip_delivery_date >= '2020-03-01'
+  AND fm.tenant_id = 'ie'
+  #AND r.online = 1
+  AND r.is_delco = 1
+  AND r.go_live_date <= DATE_SUB(DATE_TRUNC(CURRENT_DATE(), month), INTERVAL 3 month)
+  AND resto_core.country_code = 'IE'
+  AND resto_name NOT LIKE "BigChain%"
+)
+SELECT 
+  resto_name,
+  just_eat_id,
+  zone_name  AS zone_name,
+  primary_cuisine_name,
+  first_order_date,
+  last_order_date,
+  SUM(ov_first_week_resto) AS ov_first_week_resto,
+  SUM(ov_first_month_resto) AS ov_first_month_resto,
+  
+  SUM(CASE WHEN DATE_DIFF(last_order_date,first_order_date,day)  >= 365
+  THEN ov_first_year_resto 
+  END) AS ov_first_year_resto,
+
+  COUNT(DISTINCT(sys_order_id)) AS over_volume_all_time,
+  AVG(food_subtotal) AS food_subtotal_avg
+
+FROM 
+BASE
+GROUP BY 1,2,3,4,5,6
+
