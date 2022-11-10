@@ -35,13 +35,10 @@ MIN(ccd.avg_start_time_last_4weeks),
 MIN(ddd.avg_end_time_last_4weeks)
 
 FROM   shifts_base AS sb
-
 LEFT JOIN (SELECT courier_id as cid, start_date_local  from shifts_base where ranking = 2) AS ssd
 ON sb.courier_id = ssd.cid
-
 LEFT JOIN (SELECT courier_id as cid, avg_start_time_last_4weeks from shifts_base where reverse_ranking = 1) AS ccd
 ON sb.courier_id = ccd.cid
-
 LEFT JOIN (SELECT courier_id as cid, avg_end_time_last_4weeks from shifts_base where reverse_ranking = 1) AS ddd
 ON sb.courier_id = ddd.cid
 
@@ -115,7 +112,6 @@ GROUP BY  tenant_id, courier_id, first_shift_date, last_shift_date, second_shift
 --SELECT * FROM shifts
 
 
-
 status AS(
 SELECT   
 dc.tenant_id,
@@ -149,7 +145,6 @@ clv.last_28_day_weekly_courier_pay_with_tips_avg
 
 
 FROM   `just-data-warehouse.delco_analytics_team_dwh.dim_couriers` dc
-
 LEFT JOIN   `just-data-warehouse.delco_analytics_team_dwh.dim_courier_first_delivery` dcfd
 USING (tenant_id, sys_courier_id)
 
@@ -234,13 +229,11 @@ OR DATE_ADD ( status.join_date, INTERVAL 28 DAY ) < CURRENT_DATE() ) AS courier_
 (CASE WHEN (status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
 OR DATE_ADD ( status.join_date, INTERVAL 28 DAY ) < CURRENT_DATE() )) = TRUE THEN 1 ELSE 0 END) AS courier_churn_28_days_no_delivery_01,
 
-
 status.first_delivery_time IS NOT NULL AND
 DATE_ADD (status.last_delivery_time , INTERVAL 28 DAY ) < CURRENT_DATE() AS courier_churn_28_days_since_last_delivery_tf,
 
 (CASE WHEN (status.first_delivery_time IS NOT NULL AND
 DATE_ADD (status.last_delivery_time , INTERVAL 28 DAY ) < CURRENT_DATE()) = TRUE THEN 1 ELSE 0 END)  AS courier_churn_28_days_since_last_delivery_01,
-
 
 DATE ( IF ( status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
                                   OR DATE_ADD ( join_date, INTERVAL 28 DAY ) < CURRENT_DATE() ),
@@ -254,7 +247,6 @@ DATE ( IF ( status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_da
 DATE ( IF ( DATE_DIFF ( CURRENT_DATE(), status.last_delivery_time, DAY ) > 28, status.last_delivery_time, NULL ) ) AS courier_churn_post_delivery_date_28_days,
 
 -- Scheduled first shift and churn. to be completed
-
 
 
 --status.onboarded_status AS set_onboarded,
