@@ -1,0 +1,354 @@
+WITH shifts_base AS
+(
+SELECT   
+tenant_id,
+sys_assigned_courier_id AS courier_id,
+start_date_local,
+start_time_local,
+EXTRACT(HOUR FROM start_time_local),
+end_time_local,
+EXTRACT(HOUR FROM end_time_local),
+sys_scheduled_shift_id,
+shift_type,
+status AS shift_status,
+bonus AS shift_bonus,
+bonus_override AS shift_bonus_override,
+ROW_NUMBER() OVER ( PARTITION BY tenant_id, sys_assigned_courier_id ORDER BY start_time_local ASC ) AS ranking,
+ROW_NUMBER() OVER ( PARTITION BY tenant_id, sys_assigned_courier_id ORDER BY start_time_local DESC ) AS reverse_ranking,
+
+AVG (EXTRACT(HOUR FROM start_time_local)) OVER (PARTITION BY sys_assigned_courier_id ORDER BY (EXTRACT(WEEK FROM start_time_local)) RANGE BETWEEN 4 PRECEDING AND CURRENT ROW) AS avg_start_time_last_4weeks,
+
+AVG (EXTRACT(HOUR FROM end_time_local)) OVER (PARTITION BY sys_assigned_courier_id ORDER BY (EXTRACT(WEEK FROM end_time_local)) RANGE BETWEEN 4 PRECEDING AND CURRENT ROW) AS avg_end_time_last_4weeks,
+
+FROM   `just-data-warehouse.delco_analytics_team_dwh.fact_scheduled_shifts`
+WHERE tenant_id = 'ie'
+),
+
+shifts_range AS
+(
+SELECT   tenant_id,
+courier_id,
+MIN ( sb.start_date_local ) AS first_shift_date,
+MAX ( sb.start_date_local ) AS last_shift_date,
+MAX(ssd.start_date_local)   AS second_shift_date,
+MIN(ccd.avg_start_time_last_4weeks),
+MIN(ddd.avg_end_time_last_4weeks)
+
+FROM   shifts_base AS sb
+
+LEFT JOIN (SELECT courier_id as cid, start_date_local  from shifts_base where ranking = 2) AS ssd
+ON sb.courier_id = ssd.cid
+
+LEFT JOIN (SELECT courier_id as cid, avg_start_time_last_4weeks from shifts_base where reverse_ranking = 1) AS ccd
+ON sb.courier_id = ccd.cid
+
+LEFT JOIN (SELECT courier_id as cid, avg_end_time_last_4weeks from shifts_base where reverse_ranking = 1) AS ddd
+ON sb.courier_id = ddd.cid
+
+GROUP BY tenant_id, courier_id
+),
+
+shifts_dates AS #must redo this for wb but using only six months for production pruposes
+(
+  SELECT
+start_date_local
+FROM   UNNEST ( GENERATE_DATE_ARRAY ( DATE_SUB ( CURRENT_DATE, INTERVAL 120 MONTH ), CURRENT_DATE (), INTERVAL 1 DAY ) ) AS start_date_local
+),
+
+shifts_padding AS 
+(
+SELECT   
+tenant_id,
+courier_id,
+avg_start_time_last_4weeks,
+avg_end_time_last_4weeks,
+first_shift_date,
+second_shift_date,
+last_shift_date,
+start_date_local,
+sys_scheduled_shift_id,
+shift_type,
+shift_status,
+shift_bonus,
+shift_bonus_override,
+ranking,
+reverse_ranking,
+DENSE_RANK() OVER ( PARTITION BY tenant_id, courier_id ORDER BY start_date_local ASC ) AS dense_days
+FROM   `shifts_dates`
+CROSS JOIN   `shifts_range`
+LEFT  JOIN   `shifts_base`
+USING (tenant_id, courier_id, start_date_local)
+
+WHERE   start_date_local >= first_shift_date 
+AND   start_date_local <= last_shift_date
+),
+
+shifts AS 
+(
+SELECT  
+tenant_id,
+courier_id,
+first_shift_date,
+second_shift_date,
+last_shift_date,
+MAX ( IF ( ranking = 1, sys_scheduled_shift_id, NULL ) ) AS first_scheduled_shift_id,
+MAX ( IF ( ranking = 2, sys_scheduled_shift_id, NULL ) ) AS second_scheduled_shift_id,
+MAX ( IF ( reverse_ranking = 1, sys_scheduled_shift_id, NULL ) ) AS last_scheduled_shift_id,
+MAX ( IF ( first_shift_date IS NOT NULL, "First Shift Received", NULL ) ) AS shift_received,
+MAX ( IF ( ranking = 1, shift_type, NULL ) ) AS first_shift_type,
+MAX ( IF ( ranking = 1, shift_status, NULL ) ) AS first_shift_status,
+MAX ( IF ( ranking = 1, shift_bonus, NULL ) ) AS first_shift_bonus,
+MAX ( IF ( ranking = 1, shift_bonus_override, NULL ) ) AS first_shift_bonus_override,
+SUM ( IF ( DATE_ADD ( first_shift_date, INTERVAL 28 DAY ) > start_date_local, 1, 0 ) ) AS first_4_weeks_shifts,
+
+MAX ( IF ( reverse_ranking = 1, avg_start_time_last_4weeks, NULL ) ) AS avg_start_time_last_4weeks,
+#MAX ( IF ( reverse_ranking = 1, avg_end_time_last_4weeks, NULL ) ) AS avg_end_time_last_4weeks,
+
+FROM   `shifts_padding`
+
+WHERE   tenant_id IS NOT NULL
+AND   courier_id IS NOT NULL
+
+GROUP BY  tenant_id, courier_id, first_shift_date, last_shift_date, second_shift_date
+),
+
+--SELECT * FROM shifts
+
+
+
+status AS(
+SELECT   
+dc.tenant_id,
+dc.sys_courier_id AS courier_id,
+dc.email,
+dcfd.location_city,
+dc.contract_type,
+dc.can_deliver_alcohol = 1 AS can_deliver_alcohol ,
+dc.status AS courier_status,
+clv.status AS clv_status,
+clv.applicant_delivery_zone_name,
+clv.most_recent_delivery_zone_name,
+
+dc.join_date_local AS join_date,
+EXTRACT ( DATE FROM dc.first_active_time_local ) AS active_date,
+dcfd.first_delivery_time_local AS first_delivery_time,
+clv.last_delivery_date AS last_delivery_time,
+clv.total_lifetime_deliveries AS lifetime_deliveries,
+clv.lifetime_shift_count AS lifetime_shifts,
+clv.lifetime_hours_worked_sum AS lifetime_hours,
+clv.applicant_vehicle_type,
+clv.lifetime_courier_pay_per_worked_hour_with_tips,
+clv.lifetime_courier_pay_without_tips_sum,
+clv.last_28_day_order_count,
+clv.last_28_day_rejected_offers_count,
+clv.last_28_day_shift_count,
+clv.last_28_day_hours_worked_sum,
+clv.last_28_day_courier_pay_per_worked_hour_with_tips,
+clv.last_28_day_courier_pay_per_order_with_tips,
+clv.last_28_day_weekly_courier_pay_with_tips_avg
+
+
+FROM   `just-data-warehouse.delco_analytics_team_dwh.dim_couriers` dc
+
+LEFT JOIN   `just-data-warehouse.delco_analytics_team_dwh.dim_courier_first_delivery` dcfd
+USING (tenant_id, sys_courier_id)
+
+LEFT JOIN   `just-data-warehouse.logistics.courier_lifetime_view` clv 
+ON   dc.tenant_id = clv.tenant_id
+AND   dc.sys_courier_id = clv.applicant_id
+),
+
+
+courier_shift_pref AS
+(
+SELECT 
+courier_id as courier_id_csp,
+start_time  AS start_time_csp,
+end_time AS end_time_csp,
+DATE (start_time) AS date_st_of_csp,
+DATE (end_time) AS date_end_of_csp,
+FROM
+`just-data-warehouse.clean_skip_data_lake.courier_shifts_actual_availability_ie`
+GROUP BY 
+courier_id, 2,3
+ORDER BY courier_id, start_time
+
+),
+
+correlation_shfts AS
+(
+
+SELECT sb.courier_id AS courier_id_sb,
+sb.start_time_local,
+sb.end_time_local,
+start_time_csp,
+end_time_csp,
+date_st_of_csp,
+date_end_of_csp,
+
+CASE WHEN (shift_type <> 'OVERFLOW'
+AND CAST( start_time_local AS DATETIME) BETWEEN CAST(start_time_csp AS DATETIME) AND CAST(end_time_csp AS DATETIME)) THEN 1 ELSE 0 END AS correlation_0_1,
+
+FROM shifts_base AS sb
+LEFT JOIN courier_shift_pref as csp
+ON sb.courier_id = csp.courier_id_csp
+AND sb.start_date_local = csp.date_end_of_csp
+
+),
+
+/*SELECT *
+FROM
+correlation_shfts
+WHERE courier_id_sb IS NOT NULL
+AND courier_id_sb = '0026ae5e-f90f-4c27-9691-d5924890b969'
+ORDER BY courier_id_sb, start_time_local
+*/
+
+information AS(
+SELECT  
+status.tenant_id AS country_code,
+status.courier_id,
+status.email,
+status.location_city,
+status.applicant_vehicle_type,	
+status.contract_type,
+status.can_deliver_alcohol,
+
+-- Status
+status.courier_status,
+status.clv_status,
+status.applicant_delivery_zone_name,
+status.most_recent_delivery_zone_name,
+
+-- Delivery and churn
+CASE WHEN status.first_delivery_time IS NOT NULL THEN 1 ELSE 0 END AS had_they_a_delivery,
+CASE WHEN status.first_delivery_time IS NULL THEN 1 ELSE 0 END AS had_they_no_delivery,
+
+(CASE WHEN ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
+OR DATE_ADD ( status.join_date, INTERVAL 28 DAY ) < CURRENT_DATE() )
+AND (DATE_ADD (status.last_delivery_time , INTERVAL 28 DAY ) < CURRENT_DATE() OR status.first_delivery_time IS NULL)= TRUE THEN 1 ELSE 0 END) AS courier_churn_28_days_period_01,
+
+status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
+OR DATE_ADD ( status.join_date, INTERVAL 28 DAY ) < CURRENT_DATE() ) AS courier_churn_28_days_no_delivery_tf,
+
+(CASE WHEN (status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
+OR DATE_ADD ( status.join_date, INTERVAL 28 DAY ) < CURRENT_DATE() )) = TRUE THEN 1 ELSE 0 END) AS courier_churn_28_days_no_delivery_01,
+
+
+status.first_delivery_time IS NOT NULL AND
+DATE_ADD (status.last_delivery_time , INTERVAL 28 DAY ) < CURRENT_DATE() AS courier_churn_28_days_since_last_delivery_tf,
+
+(CASE WHEN (status.first_delivery_time IS NOT NULL AND
+DATE_ADD (status.last_delivery_time , INTERVAL 28 DAY ) < CURRENT_DATE()) = TRUE THEN 1 ELSE 0 END)  AS courier_churn_28_days_since_last_delivery_01,
+
+
+DATE ( IF ( status.first_delivery_time IS NULL AND ( DATE_ADD ( status.active_date, INTERVAL 28 DAY ) < CURRENT_DATE() 
+                                  OR DATE_ADD ( join_date, INTERVAL 28 DAY ) < CURRENT_DATE() ),
+           DATE_ADD ( COALESCE ( status.active_date, status.join_date ), INTERVAL 28 DAY ),
+            NULL
+          )
+      ) AS courier_churn_date_28_days_no_delivery,
+
+--DATE_DIFF ( CURRENT_DATE(), status.last_delivery_time, DAY ) > 28 AS courier_churn_post_delivery_28_days_tf,
+
+DATE ( IF ( DATE_DIFF ( CURRENT_DATE(), status.last_delivery_time, DAY ) > 28, status.last_delivery_time, NULL ) ) AS courier_churn_post_delivery_date_28_days,
+
+-- Scheduled first shift and churn. to be completed
+
+
+
+--status.onboarded_status AS set_onboarded,
+status.join_date,
+status.active_date,
+DATE_DIFF ( status.active_date, status.join_date, DAY ) AS days_to_active,
+status.first_delivery_time,
+status.last_delivery_time,
+status.first_delivery_time IS NOT NULL AS set_delivery,
+shifts.first_shift_date IS NOT NULL AS set_shift,
+DATE_DIFF ( status.first_delivery_time, status.active_date, DAY ) AS days_to_first_delivery,
+status.lifetime_deliveries,
+status.lifetime_shifts,
+status.lifetime_hours,
+status.lifetime_courier_pay_per_worked_hour_with_tips,
+status.lifetime_courier_pay_without_tips_sum,
+status.last_28_day_order_count,
+status.last_28_day_rejected_offers_count,
+status.last_28_day_shift_count,
+status.last_28_day_hours_worked_sum,
+status.last_28_day_courier_pay_per_worked_hour_with_tips,
+status.last_28_day_courier_pay_per_order_with_tips,
+status.last_28_day_weekly_courier_pay_with_tips_avg,
+
+-- Shift
+shifts.first_shift_date,
+shifts.second_shift_date,
+shifts.last_shift_date,
+DATE_DIFF ( shifts.first_shift_date, status.active_date, DAY ) AS days_to_first_shift,
+shifts.first_scheduled_shift_id,
+shifts.last_scheduled_shift_id,
+shifts.first_shift_date = DATE ( status.first_delivery_time ) AS shift_delivered,
+shifts.shift_received,
+shifts.first_shift_type,
+shifts.first_shift_status,
+shifts.first_shift_bonus,
+shifts.first_shift_bonus_override,
+shifts.first_4_weeks_shifts,
+shifts.avg_start_time_last_4weeks,
+#shifts.avg_end_time_last_4weeks,
+
+
+-- additional calc
+EXTRACT (date FROM status.first_delivery_time) = shifts.first_shift_date  AS delivery_on_first_shift,
+
+CASE WHEN (EXTRACT (date FROM status.first_delivery_time) = shifts.first_shift_date) = TRUE 
+THEN DATE_DIFF(shifts.second_shift_date, shifts.first_shift_date,  DAY) END AS time_to_2nd_shift_delivery,
+
+CASE WHEN (EXTRACT (date FROM status.first_delivery_time) = shifts.first_shift_date) = FALSE 
+THEN DATE_DIFF(shifts.second_shift_date, shifts.first_shift_date, DAY) END AS time_to_2nd_shift_no_delivery,
+
+SAFE_DIVIDE(status.lifetime_deliveries, status.lifetime_hours )AS delivery_per_hour,
+
+SAFE_DIVIDE(status.lifetime_courier_pay_without_tips_sum, status.lifetime_hours )AS pay_per_hour,
+
+DATETIME_DIFF (shifts.last_shift_date, shifts.first_shift_date, DAY) AS lifetime_tenure,
+
+SUM(correlation_shfts.correlation_0_1) OVER (PARTITION BY status.courier_id)/COUNT(correlation_shfts.correlation_0_1) OVER (PARTITION BY status.courier_id) AS shift_correlation_pct,
+
+
+CASE WHEN status.last_28_day_order_count/4 < 5 THEN '<5'
+WHEN status.last_28_day_order_count/4 < 10 THEN '<10'
+WHEN status.last_28_day_order_count/4 < 15 THEN '<15'
+WHEN status.last_28_day_order_count/4 < 20 THEN '<20'
+WHEN status.last_28_day_order_count/4 < 25 THEN '<25'
+WHEN status.last_28_day_order_count/4 < 30 THEN '<30'
+WHEN status.last_28_day_order_count/4 < 35 THEN '<35'
+WHEN status.last_28_day_order_count/4 < 40 THEN '<40'
+WHEN status.last_28_day_order_count/4 < 45 THEN '<45'
+WHEN status.last_28_day_order_count/4 < 50 THEN '<50'
+ELSE '>50' END AS blocks_5_dels_avg_last_4wks,
+
+CASE 
+WHEN status.last_28_day_order_count/4 <= 5 THEN '<=5'
+WHEN status.last_28_day_order_count/4 BETWEEN 15 AND 25 THEN '15-20 incl'
+WHEN status.last_28_day_order_count/4 >= 40 THEN '>=40'
+END AS blocks_5_or_40_dels_avg_last_4wks,
+
+
+FROM   `status` status
+
+LEFT JOIN   `shifts` shifts
+USING ( courier_id )
+
+LEFT JOIN   correlation_shfts
+ON status.courier_id = correlation_shfts.courier_id_sb
+
+WHERE   TRUE
+AND 	status.tenant_id	='ie'
+QUALIFY   ROW_NUMBER() OVER ( PARTITION BY status.courier_id ORDER BY status.first_delivery_time ASC ) = 1
+)
+
+SELECT  
+*
+
+FROM information
+ORDER BY courier_id
